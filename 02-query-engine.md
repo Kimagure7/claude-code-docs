@@ -1,610 +1,129 @@
 # 02 - 核心查询引擎 (Query Engine)
 
-## 1. 模块职责
-
-核心查询引擎是整个 Claude Code 系统的心脏，负责驱动 **Agent 对话循环**：接收用户输入、调用 AI 模型、执行工具、处理错误恢复，并产出所有中间状态事件。
-
-涉及核心文件：
-- `query.ts` — 主循环逻辑（1,729 行）
-- `QueryEngine.ts` — 会话管理封装类（1,295 行）
-- `services/api/claude.ts` — Claude API 调用与流式处理
+> 核心文件：`query.ts` (1729行) / `QueryEngine.ts` (1295行)
 
 ---
 
-## 2. 核心文件地图
+## 1. Agent 循环的本质
 
-| 文件 | 行数 | 一句话描述 |
-|------|------|-----------|
-| `query.ts` | 1,729 | `query()` 异步生成器主函数 + `queryLoop()` 循环体，含压缩、工具执行、错误恢复 |
-| `QueryEngine.ts` | 1,295 | `QueryEngine` 类，管理会话状态（消息历史、用量统计），提供 `submitMessage()` SDK 接口 |
-| `services/api/claude.ts` | 约 3,420 | `queryModel()` 封装 Anthropic API 流式调用，含重试、缓存、Thinking 配置 |
-| `context.ts` | 189 | `getSystemContext()` / `getUserContext()` 构建 Git 状态和内存上下文 |
-| `types/message.ts` | — | `Message` 消息类型族定义（UserMessage、AssistantMessage、SystemMessage 等） |
+整个 Agent 的核心逻辑极简：
+
+```
+while (true) {
+    调用 Claude API
+    if 没有 tool_use:
+        结束
+    执行工具，把结果追加到 messages[]
+    // 继续下一轮
+}
+```
+
+**messages[] 是唯一的"记忆"**。每轮工具结果追加进去，下一轮整个数组发给 Claude，Claude 通过读历史消息知道"之前做了什么"。没有任何其他状态需要维护。
+
+这就是标准的 ReAct 模式（Reason → Act → Observe → Reason...），Claude Code 的实现非常忠实于这个范式。
 
 ---
 
-## 3. 关键数据结构
+## 2. AsyncGenerator：不只是"流式输出"
 
-### 3.1 QueryParams — 查询入参
+`query()` 被实现为异步生成器，yield 的内容包括：流式 token（StreamEvent）、工具执行结果（ToolResultMessage）、系统消息、错误消息等。UI 层 `for await` 消费这些事件来实时渲染界面。
 
-```typescript
-// query.ts
-export type QueryParams = {
-  messages: Message[]                      // 当前对话消息历史
-  systemPrompt: SystemPrompt               // 系统提示（数组形式）
-  userContext: { [k: string]: string }     // 用户上下文（内存文件、日期）
-  systemContext: { [k: string]: string }   // 系统上下文（Git 状态）
-  canUseTool: CanUseToolFn                 // 权限检查函数
-  toolUseContext: ToolUseContext           // 工具执行上下文（含 AbortController）
-  fallbackModel?: string                   // 降级模型
-  querySource: QuerySource                 // 来源标识：repl_main_thread / sdk / agent:*
-  maxOutputTokensOverride?: number         // 输出 token 上限覆盖
-  maxTurns?: number                        // 最大循环轮次
-  skipCacheWrite?: boolean                 // 是否跳过 cache 写入
-  taskBudget?: { total: number }           // token 预算限制
-  deps?: QueryDeps                         // 依赖注入（microcompact/autocompact 等）
-}
+真正的价值不是流式渲染，而是**代码组合性**：
+
+```
+query()
+  yield* queryLoop()
+    yield* handleStopHooks()
+    yield* yieldMissingToolResultBlocks()
 ```
 
-### 3.2 Message 类型族
+`yield*` 可以无缝委托给子生成器，深层函数产生的事件自动冒泡到最外层消费方，不需要把回调函数一路透传下去。UI 和 SDK 两种消费方也复用同一个生成器，不需要维护两套逻辑。
 
-```typescript
-// types/message.ts
-export type Message =
-  | UserMessage
-  | AssistantMessage
-  | SystemMessage
-  | AttachmentMessage
-  | ProgressMessage
-  | ToolUseSummaryMessage
-  | RequestStartEvent
+---
 
-export type UserMessage = {
-  type: 'user'
-  uuid: string
-  timestamp: number
-  message: {
-    role: 'user'
-    content: ContentBlockParam[]   // TextBlock | ImageBlock | ToolResultBlock
-  }
-  isMeta?: boolean                 // 元信息标记（不展示给用户）
-  toolUseResult?: string
-}
+## 3. 消息压缩：各自独立，不是优先级链
 
-export type AssistantMessage = {
-  type: 'assistant'
-  uuid: string
-  timestamp: number
-  message: BetaMessage & {
-    content: (BetaContentBlock | ConnectorTextBlock)[]
-    usage?: Usage
-    stop_reason?: BetaStopReason
-  }
-  isApiErrorMessage?: boolean
-  apiError?: string
-}
+每轮循环开头都会过一遍压缩流水线：
 
-export type SystemMessage = {
-  type: 'system'
-  uuid: string
-  timestamp: number
-  subtype:
-    | 'compact_boundary'   // 压缩边界标记
-    | 'api_error'          // API 错误
-    | 'api_retry'          // 重试
-    | 'informational'      // 信息通知
-  compactMetadata?: CompactBoundaryMetadata
-  retryAttempt?: number
-  maxRetries?: number
-  retryInMs?: number
-  error?: APIError
-}
+```
+snip → microcompact → contextCollapse → autocompact
 ```
 
-### 3.3 QueryEngineConfig — 会话配置
+**每轮都检查，但大多数时候是 no-op**——每个策略内部都有条件判断，不满足就直接返回原始消息。真正触发压缩的条件各自独立：
 
-```typescript
-// QueryEngine.ts:130-179（完整类型定义）
-export type QueryEngineConfig = {
-  cwd: string                          // 工作目录
-  tools: Tools                         // 工具列表
-  commands: Command[]                  // 斜杠命令
-  mcpClients: MCPServerConnection[]    // MCP 连接
-  agents: AgentDefinition[]            // Agent 定义（子 Agent）
-  canUseTool: CanUseToolFn             // 权限检查
-  getAppState: () => AppState
-  setAppState: (f: (prev: AppState) => AppState) => void
-  initialMessages?: Message[]          // 初始消息（用于恢复会话）
-  readFileCache: FileStateCache        // 文件状态缓存（跨 turn 追踪已读文件）
-  customSystemPrompt?: string
-  appendSystemPrompt?: string
-  userSpecifiedModel?: string
-  fallbackModel?: string
-  thinkingConfig?: ThinkingConfig      // Extended Thinking 配置
-  maxTurns?: number
-  maxBudgetUsd?: number                // USD 费用预算
-  taskBudget?: { total: number }       // token 预算
-  jsonSchema?: Record<string, unknown> // 结构化输出 Schema
-  verbose?: boolean
-  replayUserMessages?: boolean         // 是否重放用户消息（SDK 会话恢复）
-  /** Handler for URL elicitations triggered by MCP tool -32042 errors. */
-  handleElicitation?: ToolUseContext['handleElicitation']  // MCP URL 弹出处理
-  includePartialMessages?: boolean     // 是否在流中包含部分消息
-  setSDKStatus?: (status: SDKStatus) => void  // SDK 状态回调
-  abortController?: AbortController   // 外部传入的取消控制器
-  orphanedPermission?: OrphanedPermission  // 孤立权限恢复（重连场景）
-  /**
-   * Snip-boundary handler: receives each yielded system message plus the
-   * current mutableMessages store. SDK-only: QueryEngine truncates here to
-   * bound memory in long headless sessions (no UI to preserve).
-   * Returns undefined if not a snip boundary, otherwise returns replayed result.
-   */
-  snipReplay?: (
-    yieldedSystemMsg: Message,
-    store: Message[],
-  ) => { messages: Message[]; executed: boolean } | undefined
-}
+| 策略 | 触发条件 | 做什么 |
+|------|---------|--------|
+| snip | 消息数超阈值 | 直接截断最早的消息 |
+| microcompact | 距上次对话 > 60分钟（缓存已冷） | 清空旧工具结果的内容，只留占位符 |
+| contextCollapse | 有待折叠的内容（内部feature） | 把历史大块内容替换为摘要 |
+| autocompact | token 预算超出 | 让 AI 生成整段对话的摘要 |
+
+microcompact 的触发条件尤其值得注意：它和 context 够不够长没有关系，而是基于**时间**——服务器端 prompt cache 超时过期了，既然缓存要重建，顺便清掉旧工具结果减少重建代价。
+
+唯一真正互斥的一对是 contextCollapse 和 autocompact：collapse 启用时会主动抑制 autocompact，让 collapse 接管上下文压缩职责。
+
+---
+
+## 4. 错误恢复：状态转移而非异常处理
+
+错误恢复没有用 try/catch 向上抛异常，而是修改循环的内部状态，然后 `continue` 重试。这让恢复逻辑和主流程融为一体。
+
+### 4.1 max_output_tokens：重新生成 vs 续写
+
+Claude 输出到一半被截断时，有两种修复思路，系统都实现了：
+
+**第一步：重新生成（升级 token 上限）**
+
+把 `maxOutputTokensOverride` 从默认 8k 升到 64k，原始消息不变，直接重试。截断的输出丢弃。
+
+设计取舍：如果问题只是"上限设太保守"，重新生成一段完整输出比拼接两段更干净。代价是截断部分的 token 浪费。
+
+**第二步：续写（注入恢复消息）**
+
+如果 64k 也不够，把截断的输出保留在 messages[] 里，追加一条对用户不可见的 meta 消息：
+
+> "Output token limit hit. Resume directly — no apology, no recap. Pick up mid-thought if that is where the cut happened."
+
+让 Claude 从断点接着写，最多重试 3 次。
+
+### 4.2 withheld 模式：主动扣住中间错误
+
+这是一个值得单独记住的设计模式。
+
+错误消息在流式阶段被**故意扣住**，不立刻 yield 给消费方，等确认恢复失败了才释放：
+
+```
+流式输出阶段发现 max_output_tokens 错误
+  → 标记为 withheld，不 yield
+  → 进入恢复流程
+  → 恢复成功：错误消息永远不出现
+  → 恢复失败（3次后）：才把错误消息 yield 出去
 ```
 
-**字段说明**：
-- `readFileCache`：跨 turn 追踪哪些文件被读取过，用于文件历史快照和变更检测
-- `handleElicitation`：MCP 服务器返回 -32042 错误码（需要 URL 验证）时的处理回调，仅 SDK 路径使用
-- `replayUserMessages`：SDK 恢复会话时，将历史消息重放给 Claude 以恢复上下文
-- `snipReplay`：HISTORY_SNIP feature 的注入点，保持 QueryEngine 本身不含 feature-gated 字符串，使之在 `bun test` 下可测试
+为什么要这样？因为 SDK 调用方（VSCode 插件等）看到任何 error 字段就会直接终止会话。如果错误可以被修复，提前暴露只会让外部调用方做出错误决策。
 
-### 3.4 循环终止原因 Terminal
+这个"扣住中间错误，只暴露无法恢复的错误"的模式，在 prompt_too_long（413）的处理里也有相同的逻辑。
 
-```typescript
-type Terminal =
-  | { reason: 'completed' }
-  | { reason: 'aborted_streaming' }      // 用户中止（流进行中）
-  | { reason: 'aborted_tools' }          // 用户中止（工具执行中）
-  | { reason: 'prompt_too_long' }        // 413 上下文超长
-  | { reason: 'image_error' }            // 媒体大小超限
-  | { reason: 'model_error' }            // 模型调用失败
-  | { reason: 'stop_hook_prevented' }    // Stop Hook 阻止继续
-  | { reason: 'hook_stopped' }           // Hook 主动停止
+### 4.3 用户中止：保证消息格式合法
 
-type Transition =                        // 继续循环的原因（内部状态）
-  | { reason: 'collapse_drain_retry' }
-  | { reason: 'reactive_compact_retry' }
-  | { reason: 'max_output_tokens_escalate' }
-  | { reason: 'max_output_tokens_recovery'; attempt: number }
-  | { reason: 'stop_hook_blocking' }
-  | { reason: 'token_budget_continuation' }
+Ctrl+C 时不能直接退出，因为 Anthropic API 要求 `tool_use` 和 `tool_result` 必须成对出现。如果 Claude 说"我要调用工具X"但没有对应结果，下次恢复会话时 API 会拒绝整个消息历史。
+
+所以中止时必须补齐：
+
+```
+用户中止
+  → 流式阶段中止：给每个未完成的 tool_use 补一个假的 tool_result
+  → 工具执行阶段中止：StreamingToolExecutor 为未完成的工具生成合成结果
+  → 确保 messages[] 格式始终合法
 ```
 
 ---
 
-## 4. 执行流程图
+## 5. 设计思路总结
 
-```
-用户输入 (string | ContentBlockParam[])
-        ↓
-  [QueryEngine.submitMessage()]
-        ↓
-  processUserInput()  ← 处理斜杠命令、构建 UserMessage
-        ↓
-  fetchSystemPromptParts()  ← 获取系统提示、用户上下文
-        ↓
-  ┌─────────────────────────────────────┐
-  │         query() 异步生成器           │
-  │                                     │
-  │  ┌──── queryLoop() while(true) ─────┤
-  │  │                                  │
-  │  │  1. 消息压缩处理                  │
-  │  │     snip → microcompact          │
-  │  │     → contextCollapse            │
-  │  │     → autocompact                │
-  │  │                                  │
-  │  │  2. 调用 AI 模型                  │
-  │  │     queryModel() 流式处理         │
-  │  │     → yield StreamEvent[]        │
-  │  │     → yield AssistantMessage     │
-  │  │                                  │
-  │  │  3. 检查 needsFollowUp           │
-  │  │     ├─ No: 错误恢复/停止检查 →   │
-  │  │     │    return Terminal         │
-  │  │     └─ Yes: 执行工具 ↓          │
-  │  │                                  │
-  │  │  4. 工具执行                      │
-  │  │     runTools() 或               │
-  │  │     StreamingToolExecutor        │
-  │  │     → yield ToolResultMessage    │
-  │  │                                  │
-  │  │  5. 收集附件 (内存、编译错误)      │
-  │  │                                  │
-  │  │  6. 更新 state → continue        │
-  │  └──────────────────────────────────┘
-  └─────────────────────────────────────┘
-        ↓
-  返回 Terminal { reason: 'completed' | ... }
-```
+Claude Code 的 Agent 循环体现了几个值得借鉴的思路：
 
----
-
-## 5. 关键代码解析
-
-### 5.1 query() 函数签名 — 异步生成器入口
-
-```typescript
-// query.ts 第 156-225 行
-
-// query() 是一个异步生成器函数
-// 它 yield 所有中间事件供 UI 层消费，最终 return Terminal
-export async function* query(
-  params: QueryParams,
-): AsyncGenerator<
-  | StreamEvent          // 流式 API 事件
-  | RequestStartEvent    // 请求开始
-  | Message              // 各类消息
-  | TombstoneMessage
-  | ToolUseSummaryMessage,
-  Terminal               // 最终返回值
-> {
-  const consumedCommandUuids: string[] = []
-
-  // 委托给真正的循环函数，使用 yield* 透传所有事件
-  const terminal = yield* queryLoop(params, consumedCommandUuids)
-
-  // 仅在正常完成时执行（中止时不会到达此处）
-  for (const uuid of consumedCommandUuids) {
-    notifyCommandLifecycle(uuid, 'completed')
-  }
-  return terminal
-}
-```
-
-**设计要点**：`yield*` 将生成器委托给 `queryLoop()`，让整个调用链成为可组合的异步流。消费方（UI 层或 SDK）只需 `for await (const event of query(...))` 即可处理所有事件。
-
-### 5.2 queryLoop() — 主循环骨架
-
-```typescript
-// query.ts 第 376-550 行（简化）
-
-async function* queryLoop(
-  params: QueryParams,
-  consumedCommandUuids: string[],
-): AsyncGenerator<...> {
-
-  // 可变循环状态
-  let state: State = {
-    messages: params.messages,
-    toolUseContext: params.toolUseContext,
-    maxOutputTokensOverride: params.maxOutputTokensOverride,
-    turnCount: 1,
-    transition: undefined,    // undefined = 首次迭代
-  }
-
-  while (true) {
-    let { toolUseContext } = state
-    const { messages, turnCount } = state
-
-    // === 1. 消息压缩（分层策略）===
-
-    // 历史截断（HISTORY_SNIP feature flag 控制）
-    if (feature('HISTORY_SNIP')) {
-      const snipResult = snipModule!.snipCompactIfNeeded(messagesForQuery)
-      messagesForQuery = snipResult.messages
-    }
-
-    // 微压缩（缓存编辑优化）
-    queryCheckpoint('query_microcompact_start')
-    messagesForQuery = (await deps.microcompact(...)).messages
-    queryCheckpoint('query_microcompact_end')
-
-    // 上下文折叠（CONTEXT_COLLAPSE feature flag）
-    if (feature('CONTEXT_COLLAPSE') && contextCollapse) {
-      messagesForQuery = (await contextCollapse.applyCollapsesIfNeeded(...)).messages
-    }
-
-    // 自动压缩（token 预算超出时触发摘要压缩）
-    queryCheckpoint('query_autocompact_start')
-    const { compactionResult } = await deps.autocompact(messagesForQuery, ...)
-    queryCheckpoint('query_autocompact_end')
-
-    // === 2. 调用 AI 模型 ===
-
-    let assistantMessages: AssistantMessage[] = []
-    let needsFollowUp = false
-    let toolUseBlocks: BetaToolUseBlock[] = []
-    let toolResults: Message[] = []
-
-    for await (const event of queryModelWithStreaming(...)) {
-      if (event.type === 'assistant') {
-        assistantMessages.push(event)
-
-        // 检测是否包含 tool_use 块
-        const blocks = event.message.content.filter(b => b.type === 'tool_use')
-        toolUseBlocks.push(...blocks)
-        if (toolUseBlocks.length > 0) needsFollowUp = true
-
-        yield event
-      }
-      // ... 其他 StreamEvent 直接 yield 给消费方
-    }
-
-    // === 3. 无工具调用 → 退出或错误恢复 ===
-
-    if (!needsFollowUp) {
-      // 检查 max_output_tokens 超限
-      if (isWithheldMaxOutputTokens(lastMessage)) {
-        // 详见 5.4 错误恢复逻辑
-      }
-
-      // 执行 Stop Hooks
-      const stopHookResult = yield* handleStopHooks(...)
-      if (stopHookResult.preventContinuation) {
-        return { reason: 'stop_hook_prevented' }
-      }
-
-      return { reason: 'completed' }  // 正常完成
-    }
-
-    // === 4. 执行工具 ===
-
-    queryCheckpoint('query_tool_execution_start')
-
-    const toolUpdates = streamingToolExecutor
-      ? streamingToolExecutor.getRemainingResults()
-      : runTools(toolUseBlocks, assistantMessages, canUseTool, toolUseContext)
-
-    for await (const update of toolUpdates) {
-      if (update.message) {
-        yield update.message
-        toolResults.push(...)
-      }
-      if (update.newContext) {
-        updatedToolUseContext = update.newContext
-      }
-    }
-
-    queryCheckpoint('query_tool_execution_end')
-
-    // === 5. 收集附件 + 准备下一轮 ===
-
-    for await (const attachment of getAttachmentMessages(...)) {
-      yield attachment
-      toolResults.push(attachment)
-    }
-
-    // 更新状态，触发下一次迭代
-    state = {
-      messages: [...messagesForQuery, ...assistantMessages, ...toolResults],
-      toolUseContext: updatedToolUseContext,
-      turnCount: turnCount + 1,
-      transition: undefined,
-    }
-    // while(true) 继续下一轮
-  }
-}
-```
-
-### 5.3 Claude API 调用层 — 流式处理
-
-```typescript
-// services/api/claude.ts 第 400-600 行（简化）
-
-async function* queryModel(
-  messages: Message[],
-  systemPrompt: SystemPrompt,
-  thinkingConfig: ThinkingConfig,
-  tools: Tools,
-  signal: AbortSignal,
-  options: Options,
-): AsyncGenerator<StreamEvent | AssistantMessage | SystemAPIErrorMessage> {
-
-  // 构建 API 请求参数
-  const params = {
-    model: normalizeModelStringForAPI(options.model),
-    messages: addCacheBreakpoints(messagesForAPI, enablePromptCaching, ...),
-    system: systemPrompt,
-    tools: allTools,
-    max_tokens: maxOutputTokens,
-    thinking: thinkingConfig,      // Extended Thinking 配置
-    betas: betasParams,            // Beta feature 头部
-  }
-
-  // 发起流式请求
-  stream = await anthropic.beta.messages.stream(params)
-
-  // 处理流事件
-  for await (const event of stream) {
-    if (event.type === 'message_start') {
-      usage = updateUsage(EMPTY_USAGE, event.message.usage)
-      yield { type: 'stream_event', event }
-    }
-
-    if (event.type === 'content_block_start') {
-      contentBlocks.push(event.content_block)
-      yield { type: 'stream_event', event }
-    }
-
-    if (event.type === 'content_block_delta') {
-      // 累积文本 delta
-      if (event.delta.type === 'text_delta') {
-        contentBlocks[event.index].text += event.delta.text
-      }
-      yield { type: 'stream_event', event }
-    }
-
-    if (event.type === 'message_stop') {
-      yield { type: 'stream_event', event }
-    }
-  }
-
-  // 流结束后，构建完整的 AssistantMessage 产出
-  yield {
-    type: 'assistant',
-    uuid: generateUUID(),
-    timestamp: Date.now(),
-    message: {
-      ...partialMessage,
-      content: contentBlocks,
-      usage,
-      stop_reason: stopReason,
-    },
-  }
-}
-```
-
-**设计要点**：每个 `content_block_delta` 事件都立刻 yield，UI 层可以实时渲染增量文本，不需要等待整个响应。
-
-### 5.4 错误恢复机制
-
-```typescript
-// query.ts — 三层恢复策略
-
-// === 场景 1：max_output_tokens 超限 ===
-if (isWithheldMaxOutputTokens(lastMessage)) {
-
-  // 恢复 1：升级 token 上限（escalate to 64k）
-  if (capEnabled && maxOutputTokensOverride === undefined) {
-    state = { ...state, maxOutputTokensOverride: ESCALATED_MAX_TOKENS,
-              transition: { reason: 'max_output_tokens_escalate' } }
-    continue  // 重新循环
-  }
-
-  // 恢复 2：发送恢复消息（最多重试 3 次）
-  if (maxOutputTokensRecoveryCount < MAX_OUTPUT_TOKENS_RECOVERY_LIMIT) {
-    const recoveryMessage = createUserMessage({
-      content: 'Output token limit hit. Resume directly ...',
-      isMeta: true,  // 不展示给用户
-    })
-    state = {
-      messages: [...messagesForQuery, ...assistantMessages, recoveryMessage],
-      maxOutputTokensRecoveryCount: maxOutputTokensRecoveryCount + 1,
-      transition: { reason: 'max_output_tokens_recovery', attempt: ... },
-    }
-    continue
-  }
-}
-
-// === 场景 2：Prompt 过长 (413 错误) ===
-if (isWithheld413) {
-
-  // 尝试 1：上下文折叠（把历史对话压缩掉）
-  if (contextCollapse && state.transition?.reason !== 'collapse_drain_retry') {
-    const drained = contextCollapse.recoverFromOverflow(...)
-    if (drained.committed > 0) {
-      state = { ...state, transition: { reason: 'collapse_drain_retry' } }
-      continue
-    }
-  }
-
-  // 尝试 2：反应式压缩（全面摘要压缩）
-  if (reactiveCompact) {
-    const compacted = await reactiveCompact.tryReactiveCompact(...)
-    if (compacted) {
-      state = { ...state, transition: { reason: 'reactive_compact_retry' } }
-      continue
-    }
-  }
-
-  // 全部失败 → 返回错误
-  return { reason: 'prompt_too_long' }
-}
-
-// === 场景 3：用户中止（AbortController 触发）===
-if (toolUseContext.abortController.signal.aborted) {
-
-  // 确保工具 use/result 配对完整（API 格式要求）
-  yield* yieldMissingToolResultBlocks(assistantMessages, 'Interrupted by user')
-
-  return { reason: 'aborted_streaming' }
-}
-```
-
-### 5.5 QueryEngine.submitMessage() — SDK 接口
-
-```typescript
-// QueryEngine.ts 第 162-350 行（简化）
-
-async *submitMessage(
-  prompt: string | ContentBlockParam[],
-  options?: { uuid?: string; isMeta?: boolean },
-): AsyncGenerator<SDKMessage, void, unknown> {
-
-  // 1. 获取系统提示各部分
-  const { defaultSystemPrompt, userContext, systemContext } =
-    await fetchSystemPromptParts({ tools, mcpClients, ... })
-
-  // 2. 处理用户输入（可能是斜杠命令）
-  const { messages: messagesFromUserInput, shouldQuery } =
-    await processUserInput({
-      input: prompt,
-      mode: 'prompt',
-      messages: this.mutableMessages,
-      querySource: 'sdk',
-    })
-
-  // 3. 追加到可变消息历史
-  this.mutableMessages.push(...messagesFromUserInput)
-
-  // 4. 进入 query() 循环
-  const queryGenerator = query({
-    messages: [...this.mutableMessages],
-    systemPrompt,
-    userContext,
-    systemContext,
-    canUseTool: wrappedCanUseTool,  // 包装了权限拒绝统计
-    toolUseContext,
-    querySource: 'sdk',
-    maxTurns: this.config.maxTurns,
-  })
-
-  // 5. 消费生成器，转换为 SDK 格式并 yield
-  for await (const message of queryGenerator) {
-    // 累积 token 使用量统计
-    if (message.type === 'stream_event' && message.event.type === 'message_stop') {
-      this.totalUsage = accumulateUsage(this.totalUsage, currentMessageUsage)
-    }
-    // 转换为 SDK 消息格式并产出
-    yield convertToSDKMessage(message)
-  }
-}
-```
-
----
-
-## 6. 设计思路总结
-
-### 异步生成器作为事件总线
-
-`query()` 不是普通的 async 函数，而是 `AsyncGenerator`。这带来几个优势：
-- **惰性求值**：消费方（UI）控制消费速度，无需内部维护缓冲队列
-- **背压支持**：如果 UI 渲染慢，生成器自然暂停
-- **组合性**：`yield*` 可以无缝委托给子生成器（`queryLoop`、`handleStopHooks` 等）
-
-### 状态机式循环
-
-`while(true) + state 对象 + continue` 形成一个隐式状态机。每次迭代可以通过修改 `state.transition` 来记录"为什么进入下一轮"，方便日志分析和 telemetry 上报。
-
-### 分层压缩策略
-
-上下文压缩分为四层，按代价从低到高依次尝试：
-1. **历史截断 (snip)**：直接删除早期消息
-2. **微压缩 (microcompact)**：优化缓存编辑格式
-3. **上下文折叠 (collapse)**：把大块内容替换为摘要
-4. **自动压缩 (autocompact)**：让 AI 生成完整对话摘要
-
-### 工具执行两路径
-
-- `StreamingToolExecutor`：并发执行多个工具，流式返回结果
-- `runTools()`：串行同步执行（作为降级路径）
-
----
-
-## 7. 与其他模块的联系
-
-```
-query.ts
-  ├── 依赖 → services/api/claude.ts      (queryModel 调用)
-  ├── 依赖 → tools/ (通过 runTools)       (工具执行)
-  ├── 依赖 → services/mcp/              (MCP 工具执行)
-  ├── 依赖 → utils/permissions/         (canUseTool 权限检查)
-  ├── 依赖 → context.ts                  (getSystemContext / getUserContext)
-  ├── 被调用 → QueryEngine.ts            (submitMessage 封装)
-  ├── 被调用 → entrypoints/init.ts       (REPL 模式入口)
-  └── 被调用 → tools/AgentTool           (子 Agent 递归调用)
-```
+1. **极简状态**：messages[] 就是全部状态，Agent 循环不需要额外的状态机
+2. **错误是状态转移**：能自动修复的错误在循环内部消化，不暴露给外部
+3. **消息可以不对称**：系统可以往 messages[] 插入用户不可见的 meta 消息来引导模型行为，这是一个在对话历史里做"旁白"的技巧
+4. **格式合法性是硬约束**：任何情况下都要保证 messages[] 对 API 合法，这是持久化和恢复会话的基础

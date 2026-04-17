@@ -1,31 +1,27 @@
-# 14 - 一次请求的完整生命周期追踪
+# 14 - 一次请求的完整生命周期
 
-> **场景**：用户在 REPL 中输入 `fix the bug in foo.ts`，按下回车，直到 Claude 读取文件、定位 bug、执行编辑、输出结果，全程发生了什么？
->
-> 本篇不讲模块功能，只讲**这条具体请求从输入到输出的完整代码执行路径**，串联 01~13 的所有知识点。
+> 场景：用户输入 `fix the bug in foo.ts`，按下回车，直到 Claude 完成修复。串联前面所有知识点。
 
 ---
 
 ## 全局时间线
 
 ```
-T=0ms    用户按下回车
-T=1ms    REPL 捕获输入，构建 UserMessage
-T=2ms    processUserInput() 处理斜杠命令检测
-T=5ms    fetchSystemPromptParts() 组装系统提示
+T=0ms    用户按回车
+T=1ms    REPL 捕获输入，检查是否是 /command
+T=5ms    并行获取系统提示组件（git 状态、记忆文件、工具描述）
 T=10ms   query() 异步生成器启动
-T=12ms   microcompact / autocompact 检查（首轮通常跳过）
-T=15ms   queryModel() 发起 HTTPS 流式请求到 Anthropic API
-T=?ms    [等待网络 + Claude 推理，通常 1-5 秒]
-T=1200ms 第一个 content_block_delta 到达，UI 开始渲染文字
-T=2000ms Claude 决定调用 FileReadTool，流式返回 tool_use 块
-T=2010ms validateInput() + checkPermissions() 通过
-T=2015ms FileReadTool.call() 执行，读取 foo.ts
+T=12ms   微压缩/自动压缩检查（首轮通常跳过）
+T=15ms   发起 HTTPS 流式请求到 Anthropic API
+T=1200ms 第一个 token 到达，UI 开始流式渲染文字
+T=2000ms Claude 决定调用 FileReadTool，stop_reason = 'tool_use'
+T=2010ms validateInput() + checkPermissions() 通过（只读工具自动允许）
+T=2015ms FileReadTool.call() 执行，读 foo.ts
 T=2020ms 工具结果追加到消息历史，第二轮 API 请求发起
 T=3500ms Claude 决定调用 FileEditTool
-T=3510ms checkPermissions() → 弹出权限确认 UI
+T=3510ms checkPermissions() → 弹出权限确认 UI（写操作需确认）
 T=3515ms 用户按 y 确认
-T=3520ms FileEditTool.call() 执行字符串替换
+T=3520ms FileEditTool 执行字符串替换，写入磁盘
 T=3530ms 生成 diff，UI 渲染编辑结果
 T=3600ms Claude 输出最终回复，stop_reason = 'end_turn'
 T=3610ms Stop Hooks 执行（若配置）
@@ -35,642 +31,112 @@ T=3625ms REPL 等待下一次输入
 
 ---
 
-## 第一阶段：输入捕获（REPL → UserMessage）
+## 阶段 1：输入处理
 
-### 1.1 键盘事件捕获
+用户按回车，REPL 的 `onSubmit` 触发。第一件事：检查是否是 `/` 开头的命令。是命令就走命令系统（不进入 AI 对话），不是命令就封装成 `UserMessage`。
 
-```
-src/components/App.tsx
-  └── src/components/REPL.tsx
-        └── src/hooks/useKeyboardShortcuts.ts
-```
-
-用户按下回车时，`REPL.tsx` 中的 `onSubmit` 回调触发：
-
-```typescript
-// src/components/REPL.tsx（简化）
-const onSubmit = async (input: string) => {
-  if (!input.trim()) return
-
-  // 1. 写入本地历史（↑ 键可回翻）
-  addToHistory(input)
-
-  // 2. 将输入传递给 QueryEngine
-  void queryEngine.submitMessage(input)
-}
-```
-
-### 1.2 processUserInput() — 斜杠命令检测
-
-```typescript
-// src/QueryEngine.ts → processUserInput()
-// 在进入 AI 对话前，先判断是否是斜杠命令
-
-if (input.startsWith('/')) {
-  const command = findCommand(commands, input)
-  if (command) {
-    // 斜杠命令直接执行，不进入 AI 对话
-    // 例如 /clear → 清空历史，/model → 切换模型
-    return { messages: [], shouldQuery: false }
-  }
-}
-
-// 普通输入 → 构建 UserMessage
-const userMessage: UserMessage = {
-  type: 'user',
-  uuid: generateUUID(),
-  timestamp: Date.now(),
-  message: {
-    role: 'user',
-    content: [{ type: 'text', text: input }],
-  },
-}
-return { messages: [userMessage], shouldQuery: true }
-```
-
-**我们的输入 `fix the bug in foo.ts` 不是斜杠命令**，直接被封装为 `UserMessage`，进入下一阶段。
+`UserMessage` 格式是 Anthropic API 要求的：`{ role: 'user', content: [{ type: 'text', text: input }] }`。
 
 ---
 
-## 第二阶段：系统提示组装
+## 阶段 2：系统提示组装
+
+进入 query 前，并行获取三类上下文：
 
 ```
-src/QueryEngine.ts → fetchSystemPromptParts()
-  ├── src/utils/systemPrompt.ts         (核心 system prompt 文本)
-  ├── src/context.ts → getGitStatus()   (Git 状态)
-  └── src/memdir/ → getMemoryFiles()    (CLAUDE.md + 记忆文件)
+git 状态   → 当前分支、修改文件列表（git status 显示 foo.ts 有修改）
+记忆文件   → CLAUDE.md + ~/.claude/memory/ 里的记忆
+工具描述   → 每个工具的 description() 方法返回值
 ```
 
-### 2.1 fetchSystemPromptParts()
-
-```typescript
-// src/QueryEngine.ts（简化）
-const { defaultSystemPrompt, userContext, systemContext } =
-  await fetchSystemPromptParts({
-    tools,
-    mcpClients,
-    cwd,
-    customSystemPrompt,
-    appendSystemPrompt,
-  })
-```
-
-这一步并行完成三件事：
-
-```typescript
-const [gitStatus, memoryFiles, toolDescriptions] = await Promise.all([
-  getGitStatus(),           // 当前 git branch、status、最近 commits
-  getMemoryFiles(cwd),      // 读取 CLAUDE.md 和 ~/.claude/memory/*.md
-  getToolDescriptions(tools), // 每个工具的 description() 方法
-])
-```
-
-### 2.2 最终发给 Claude API 的 system prompt 结构
-
-```
-[系统基础提示]
-  - Claude Code 的角色定位和行为规范
-  - 工具使用规范
-
-[环境信息]
-  <system>
-    Platform: darwin
-    Date: 2026/04/17
-    CWD: /Users/user/project
-  </system>
-
-[Git 状态]
-  <git_status>
-    Current branch: main
-    Status: M  foo.ts
-    Recent commits: ...
-  </git_status>
-
-[记忆文件]
-  <memory_files>
-    [CLAUDE.md 内容]
-  </memory_files>
-
-[工具描述]
-  FileReadTool: A tool for reading files...
-  FileEditTool: A tool for editing files...
-  BashTool: ...
-  ...
-```
-
-注意：`git status` 显示 `foo.ts` 有修改，这会直接帮助 Claude 定位到这个文件。
+这三类信息合并成系统提示，一起发给 API。`git status` 显示 `foo.ts` 有修改这个细节，会直接帮助 Claude 定位到这个文件，减少探索步骤。
 
 ---
 
-## 第三阶段：进入 query() 对话循环
+## 阶段 3：第一轮 API 请求
 
+`query()` 是 async generator，内部是 `while(true)` 循环。第一轮：
+
+1. 微压缩检查 → 消息历史只有一条，跳过
+2. 调用 `queryModelWithStreaming()`，发起流式 HTTPS 请求
+3. `yield` 每个流式事件给 UI → 用户实时看到文字流出
+
+请求参数里工具列表以 JSON Schema 形式传给 API。Claude 看到工具后知道可以调用 `Read`（FileReadTool）来读文件。
+
+流式响应中，文字 token 和 tool_use 参数 JSON 都是流式到达的，UI 实时渲染文字，等 tool_use 完整接收后再处理工具调用。
+
+---
+
+## 阶段 4：FileReadTool 执行
+
+`stop_reason = 'tool_use'`，`queryLoop` 检测到需要执行工具：
+
+1. `findToolByName(tools, 'Read')` 找到 FileReadTool 实例
+2. Zod Schema 校验入参
+3. `validateInput()` 检查路径合法性（存在？在工作目录内？不是设备文件？）
+4. `checkPermissions()` → FileReadTool 是只读工具，默认模式自动允许，不弹 UI
+5. `call()` 读文件，记录到 `readFileState`（记录 mtime，供后续写操作的时间戳验证）
+6. 返回带行号的文件内容
+
+工具结果封装为 `UserMessage`（API 要求 tool_result 在 user 角色里），追加到消息历史，循环继续。
+
+**此时消息历史：**
 ```
-src/QueryEngine.ts → submitMessage()
-  └── src/query.ts → query()
-        └── src/query.ts → queryLoop()
-```
-
-### 3.1 第一轮循环开始
-
-```typescript
-// src/query.ts — queryLoop() 第一次迭代
-
-// === 压缩检查（首轮通常跳过）===
-// turnCount=1，消息历史只有一条 UserMessage，无需压缩
-messagesForQuery = await deps.microcompact(messages, ...)
-// → 直接返回，无任何压缩
-
-// === 调用 AI 模型 ===
-for await (const event of queryModelWithStreaming({
-  messages: messagesForQuery,
-  systemPrompt,
-  tools: assembledTools,  // 所有可用工具的 JSON Schema
-  model: 'claude-sonnet-4-5',
-  signal: abortController.signal,
-})) {
-  yield event  // 流式事件透传给 UI
-}
+UserMessage: "fix the bug in foo.ts"
+AssistantMessage: 分析文字 + tool_use(Read, foo.ts)
+UserMessage: tool_result(foo.ts 内容)
 ```
 
 ---
 
-## 第四阶段：HTTP 请求与流式响应
+## 阶段 5：第二轮 API 请求
 
-```
-src/query.ts → queryModelWithStreaming()
-  └── src/services/api/claude.ts → queryModel()
-        └── src/services/api/client.ts → getAnthropicClient()
-              └── @anthropic-ai/sdk → anthropic.beta.messages.stream()
-```
+携带更新后的消息历史（包括 foo.ts 内容）再次调用 Claude。Claude 读到代码后发现问题，决定用 FileEditTool 修复。
 
-### 4.1 构建 API 请求参数
-
-```typescript
-// src/services/api/claude.ts（简化）
-
-const params = {
-  model: 'claude-sonnet-4-5-20251101',
-  messages: addCacheBreakpoints(messagesForAPI, true),
-  // ↑ 在合适位置插入 cache_control: { type: 'ephemeral' }
-  // 命中 Prompt Cache 可节省约 90% 的输入 token 费用
-
-  system: systemPrompt,  // 上面组装好的系统提示
-
-  tools: [
-    // 每个工具被序列化为 Anthropic API 格式
-    {
-      name: 'Read',
-      description: 'A tool for reading files...',
-      input_schema: { type: 'object', properties: { file_path: ... } }
-    },
-    {
-      name: 'str_replace_based_edit_tool',
-      description: 'A tool for editing files...',
-      input_schema: { ... }
-    },
-    // ... 其余工具
-  ],
-
-  max_tokens: 32000,
-  stream: true,
-}
-
-stream = await anthropic.beta.messages.stream(params)
-```
-
-### 4.2 流式事件的实时处理
-
-网络请求发出后，Anthropic 服务器开始推送 Server-Sent Events：
-
-```
-← message_start        { usage: { input_tokens: 1842 } }
-← content_block_start  { index: 0, content_block: { type: 'text' } }
-← content_block_delta  { delta: { text: "I'll " } }
-← content_block_delta  { delta: { text: "look at " } }
-← content_block_delta  { delta: { text: "foo.ts " } }
-← content_block_delta  { delta: { text: "to find " } }
-← content_block_delta  { delta: { text: "the bug." } }
-← content_block_stop
-
-← content_block_start  { index: 1, content_block: { type: 'tool_use', name: 'Read' } }
-← content_block_delta  { delta: { type: 'input_json_delta', partial_json: '{"file' } }
-← content_block_delta  { delta: { partial_json: '_path": "' } }
-← content_block_delta  { delta: { partial_json: '/path/to/foo.ts"}' } }
-← content_block_stop
-
-← message_delta        { stop_reason: 'tool_use' }
-← message_stop
-```
-
-每个 `content_block_delta` 都立刻被 `yield` 给 UI 层，用户实时看到文字流出。
-
-### 4.3 UI 渲染流式文字
-
-```typescript
-// src/components/AssistantMessage.tsx（简化）
-// 消费 stream_event，实时拼接文字
-
-for await (const event of queryGenerator) {
-  if (event.type === 'stream_event') {
-    if (event.event.type === 'content_block_delta') {
-      if (event.event.delta.type === 'text_delta') {
-        // 追加到当前文字块，触发 React re-render
-        setCurrentText(prev => prev + event.event.delta.text)
-      }
-    }
-  }
-}
-```
-
-终端中用户看到：
-```
-I'll look at foo.ts to find the bug.
-```
-（文字逐字出现，不是一次性渲染）
+这次 stop_reason = 'tool_use'，参数是具体的 `old_string` 和 `new_string`。
 
 ---
 
-## 第五阶段：工具调用（FileReadTool）
+## 阶段 6：FileEditTool + 权限确认
 
-流结束后，`queryLoop()` 检测到 `stop_reason === 'tool_use'`：
-
-```typescript
-// src/query.ts — queryLoop()
-
-const toolUseBlocks = assistantMessage.message.content
-  .filter(block => block.type === 'tool_use')
-// → [{ type: 'tool_use', id: 'toolu_01...', name: 'Read', input: { file_path: '/path/to/foo.ts' } }]
-
-needsFollowUp = toolUseBlocks.length > 0  // true
-```
-
-### 5.1 工具查找
-
-```typescript
-// src/query.ts → runTools()
-
-const tool = findToolByName(tools, 'Read')
-// → FileReadTool 实例
-```
-
-### 5.2 输入校验
-
-```typescript
-// src/tools/FileReadTool/FileReadTool.ts
-
-// Zod schema 校验
-const parseResult = tool.inputSchema.safeParse({
-  file_path: '/path/to/foo.ts'
-})
-// → { success: true, data: { file_path: '/path/to/foo.ts' } }
-
-// validateInput()（可选，FileReadTool 实现了此方法）
-const validation = await tool.validateInput(input, context)
-// 检查：文件是否存在？路径是否在工作目录内？
-// → { ok: true }
-```
-
-### 5.3 权限检查
-
-```typescript
-// src/utils/permissions.ts
-
-const permResult = await tool.checkPermissions(input, context)
-// FileReadTool.isReadOnly() === true
-// 只读工具在默认权限模式下自动允许，无需用户确认
-// → { behavior: 'allow' }
-```
-
-### 5.4 工具执行
-
-```typescript
-// src/tools/FileReadTool/FileReadTool.ts → call()
-
-const content = await fs.readFile('/path/to/foo.ts', 'utf-8')
-const lines = content.split('\n')
-
-// 文件内容按行处理，加上行号前缀（方便 Claude 定位）
-const numbered = lines.map((line, i) =>
-  `${String(i + 1).padStart(4, ' ')}\t${line}`
-).join('\n')
-
-// 记录到 readFileState（跨 turn 缓存，避免重复读取）
-context.readFileState.set('/path/to/foo.ts', {
-  content,
-  mtime: stat.mtimeMs,
-})
-
-return {
-  data: {
-    type: 'text',
-    filePath: '/path/to/foo.ts',
-    content: numbered,
-    numLines: lines.length,
-    totalLines: lines.length,
-    startLine: 1,
-  }
-}
-```
-
-### 5.5 工具结果追加到消息历史
-
-```typescript
-// src/query.ts — 工具结果被封装为 UserMessage（API 要求）
-
-const toolResultMessage: UserMessage = {
-  type: 'user',
-  uuid: generateUUID(),
-  timestamp: Date.now(),
-  message: {
-    role: 'user',
-    content: [{
-      type: 'tool_result',
-      tool_use_id: 'toulu_01...',
-      content: numbered,  // foo.ts 的完整内容（带行号）
-    }]
-  },
-  toolUseResult: 'Read',
-}
-```
-
-**此时消息历史变为：**
-```
-messages = [
-  UserMessage:     "fix the bug in foo.ts"
-  AssistantMessage: "I'll look at foo.ts..." + tool_use(Read, foo.ts)
-  UserMessage:     tool_result(foo.ts 内容)   ← 刚追加
-]
-```
+1. `checkPermissions()` → FileEditTool 是写操作，默认模式需要用户确认
+2. 弹出权限 UI，显示 diff 预览
+3. 用户按 y
+4. `validateInput()` 检查 `readFileState` 里有这个文件的读取记录（"先读后写"约束）
+5. 验证 `old_string` 在文件中唯一匹配
+6. 执行字符串替换，写入磁盘
+7. 通知 LSP 服务器（触发重新诊断）、通知 VS Code（更新 diff 视图）
 
 ---
 
-## 第六阶段：第二轮 API 请求
+## 阶段 7：第三轮 API 请求（最终回复）
 
-`queryLoop()` 的 `while(true)` 继续下一次迭代，携带更新后的消息历史再次调用 Claude：
+消息历史再次追加工具结果（编辑成功 + diff），第三次调用 Claude。
 
-```
-← content_block_start  { type: 'text' }
-← content_block_delta  { text: "I found the bug on line 42: ..." }
-← content_block_stop
-
-← content_block_start  { type: 'tool_use', name: 'str_replace_based_edit_tool' }
-← content_block_delta  { partial_json: '{"file_path":"/path/to/foo.ts",' }
-← content_block_delta  { partial_json: '"old_string":"return x * 2",' }
-← content_block_delta  { partial_json: '"new_string":"return x + 2"}' }
-← content_block_stop
-
-← message_delta  { stop_reason: 'tool_use' }
-```
+这次 Claude 输出最终解释文字，`stop_reason = 'end_turn'`，`needsFollowUp = false`，循环退出。
 
 ---
 
-## 第七阶段：工具调用（FileEditTool）+ 权限确认
+## 阶段 8：退出与清理
 
-### 7.1 权限检查（需要用户确认）
-
-```typescript
-// src/utils/permissions.ts
-
-// FileEditTool.isReadOnly() === false
-// 写操作在默认权限模式下需要用户确认
-
-const permResult = await tool.checkPermissions(
-  { file_path: '/path/to/foo.ts', old_string: 'return x * 2', new_string: 'return x + 2' },
-  context
-)
-// → { behavior: 'ask', message: '是否允许编辑 foo.ts？' }
-```
-
-### 7.2 弹出权限确认 UI
-
-```typescript
-// src/query.ts → canUseTool()
-
-// setToolJSX 回调触发 React 渲染权限确认组件
-context.setToolJSX?.(
-  <PermissionRequest
-    tool={tool}
-    input={input}
-    onAllow={() => resolve({ allow: true })}
-    onDeny={() => resolve({ allow: false })}
-  />
-)
-
-// 阻塞等待用户操作
-const response = await permissionPromise
-```
-
-终端中渲染：
-```
-┌─ Permission Request ────────────────────────────────┐
-│ str_replace_based_edit_tool wants to edit foo.ts    │
-│                                                      │
-│ - return x * 2                                       │
-│ + return x + 2                                       │
-│                                                      │
-│ [y] Allow  [n] Deny  [a] Always Allow               │
-└─────────────────────────────────────────────────────┘
-```
-
-### 7.3 用户按 `y`，执行编辑
-
-```typescript
-// src/tools/FileEditTool/FileEditTool.ts → call()
-
-// 1. 读取文件当前内容
-const currentContent = await fs.readFile(file_path, 'utf-8')
-
-// 2. 验证 old_string 唯一性
-const occurrences = countOccurrences(currentContent, old_string)
-if (occurrences === 0) throw new Error('old_string not found')
-if (occurrences > 1) throw new Error('old_string matches multiple locations')
-
-// 3. 执行替换
-const newContent = currentContent.replace(old_string, new_string)
-
-// 4. 原子写入（先写 .tmp 再 rename，防止写入中断导致文件损坏）
-await fs.writeFile(file_path + '.tmp', newContent, 'utf-8')
-await fs.rename(file_path + '.tmp', file_path)
-
-// 5. 生成 diff 供 UI 展示
-const diff = await fetchSingleFileGitDiff(file_path)
-
-return {
-  data: {
-    type: 'edit',
-    filePath: file_path,
-    diff,
-    numLines: newContent.split('\n').length,
-  }
-}
-```
-
-### 7.4 UI 渲染编辑结果
-
-```typescript
-// src/tools/FileEditTool/UI.tsx → renderToolResultMessage()
-
-// 渲染 diff 格式的编辑结果
-return (
-  <Box flexDirection="column">
-    <Text>Edited foo.ts</Text>
-    <DiffView diff={diff} />
-  </Box>
-)
-```
-
-终端中显示：
-```
-✓ Edited foo.ts
-  - return x * 2
-  + return x + 2
-```
+1. `handleStopHooks()` 检查是否有 Stop hooks（比如自动运行测试）
+2. 如果 hooks 要求继续对话（测试失败，让 Claude 修复），循环重新启动
+3. 否则 `query()` 返回 `Terminal { reason: 'completed' }`
+4. 统计 token 用量（含 prompt cache 命中的 token 数）
+5. REPL 恢复输入等待状态
 
 ---
 
-## 第八阶段：第三轮 API 请求（最终回复）
+## 关键设计的串联
 
-消息历史继续增长：
-```
-messages = [
-  UserMessage:      "fix the bug in foo.ts"
-  AssistantMessage: text + tool_use(Read)
-  UserMessage:      tool_result(foo.ts 内容)
-  AssistantMessage: "I found the bug..." + tool_use(FileEdit)
-  UserMessage:      tool_result(edit success, diff)   ← 新追加
-]
-```
+| 环节 | 设计决策 | 为什么 |
+|------|---------|--------|
+| 系统提示 | 并行获取 git/记忆/工具描述 | 三者互相独立，没有依赖关系 |
+| 流式事件 | AsyncGenerator yield 每个 token | UI 实时渲染，调用方不需要内部缓冲 |
+| 只读工具 | 自动允许，不弹 UI | 降低摩擦，读操作风险低 |
+| 写操作 | 需要确认，显示 diff | 不可逆操作需要人类监督 |
+| 先读后写 | readFileState 约束 | 防止 Claude 在不了解当前内容的情况下覆盖文件 |
+| Stop Hooks | 可以 preventContinuation | 外部脚本（测试）可以决定对话是否结束 |
+| Prompt Cache | 在工具描述后插入 cache_control | 系统提示和工具描述几乎不变，命中率极高 |
 
-Claude 第三次被调用，这次没有工具调用，直接输出文字：
-
-```
-← content_block_delta  { text: "I've fixed the bug in foo.ts." }
-← content_block_delta  { text: " The issue was a multiplication operator..." }
-← content_block_delta  { text: " I changed `return x * 2` to `return x + 2`." }
-← message_delta        { stop_reason: 'end_turn' }
-```
-
-`stop_reason === 'end_turn'` → `needsFollowUp = false`
-
----
-
-## 第九阶段：循环终止
-
-### 9.1 Stop Hooks 执行
-
-```typescript
-// src/query.ts → handleStopHooks()
-
-// 检查用户是否配置了 stop hooks（.claude/settings.json 中的 hooks.Stop）
-const stopHooks = getStopHooks()
-if (stopHooks.length === 0) {
-  // 没有 stop hooks，直接返回
-  return { preventContinuation: false }
-}
-
-// 有 stop hooks → 执行，例如自动运行测试、格式化代码等
-for (const hook of stopHooks) {
-  const result = await executeHook(hook, { lastMessage, messages })
-  if (result.continue) {
-    // hook 要求继续对话（例如：测试失败，让 Claude 继续修复）
-    return { preventContinuation: true, injectedMessages: result.messages }
-  }
-}
-```
-
-### 9.2 query() 返回
-
-```typescript
-// src/query.ts
-return { reason: 'completed' }
-// ↑ Terminal 类型，结束整个对话循环
-```
-
-### 9.3 统计 token 用量
-
-```typescript
-// src/QueryEngine.ts
-this.totalUsage = accumulateUsage(this.totalUsage, currentRequestUsage)
-// totalUsage = {
-//   input_tokens: 1842 + 3200 + 1100,
-//   output_tokens: 45 + 89 + 52,
-//   cache_read_input_tokens: 1650,   // 命中 Prompt Cache 的 token 数
-// }
-```
-
----
-
-## 第十阶段：REPL 恢复等待
-
-```typescript
-// src/components/REPL.tsx
-
-// query() 生成器耗尽，REPL 恢复 input 状态
-setIsLoading(false)
-setCurrentInput('')
-// 重新渲染输入框，等待下一次用户输入
-```
-
-终端最终状态：
-```
-> fix the bug in foo.ts
-
-I'll look at foo.ts to find the bug.
-
-✓ Read foo.ts (87 lines)
-
-I found the bug on line 42: the function was using multiplication
-instead of addition.
-
-✓ Edited foo.ts
-  - return x * 2
-  + return x + 2
-
-I've fixed the bug in foo.ts. The issue was a multiplication operator
-being used where addition was expected. Changed `return x * 2` to
-`return x + 2`.
-
->                                ← 等待下一次输入
-```
-
----
-
-## 完整调用栈汇总
-
-```
-REPL.tsx::onSubmit()
-  └── QueryEngine::submitMessage()
-        ├── processUserInput()              → UserMessage
-        ├── fetchSystemPromptParts()        → SystemPrompt + contexts
-        └── query()  ─── 异步生成器 ────────────────────────┐
-              └── queryLoop()                               │
-                    ├── [微压缩/自动压缩]                    │
-                    ├── queryModelWithStreaming()            │  yield StreamEvents
-                    │     └── queryModel()                  │  → UI 实时渲染
-                    │           └── anthropic.messages.stream() │
-                    ├── [检测 tool_use 块]                   │
-                    ├── runTools()                           │
-                    │     ├── findToolByName()               │
-                    │     ├── tool.validateInput()           │
-                    │     ├── tool.checkPermissions()        │
-                    │     │     └── [权限 UI 弹出/等待]       │
-                    │     └── tool.call()                    │
-                    │           ├── FileReadTool: fs.readFile │
-                    │           └── FileEditTool: fs.writeFile│
-                    ├── [更新 messages，继续下一轮]           │
-                    └── return Terminal { reason: 'completed' }
-```
-
----
-
-## 关键设计回顾
-
-| 环节 | 设计决策 | 理由 |
-|------|---------|------|
-| `query()` 用异步生成器 | `yield` 每个流式事件 | UI 可以实时渲染，无需内部缓冲队列 |
-| 工具结果封装为 `UserMessage` | Anthropic API 要求 `tool_result` 在 user 角色中 | 协议约束 |
-| `FileEditTool` 用字符串替换而非行号 | 多次编辑后行号偏移 | 稳定性，Claude 不会因前一次编辑而行号错位 |
-| Prompt Cache + 缓存断点 | 在工具描述后插入 `cache_control` | 系统提示和工具描述几乎不变，命中率极高 |
-| `while(true)` + `state` 对象 | 隐式状态机 | 可通过 `state.transition` 追踪每轮原因，便于调试 |
-| `readFileState` 跨 turn 缓存 | 记录已读文件的 mtime | `file_unchanged` 响应避免重发相同内容，节省 token |
-| Stop Hooks 在循环终止处执行 | `handleStopHooks()` 可 `preventContinuation` | 允许外部脚本决定是否继续对话（如测试失败自动重试） |
+整个过程体现了 02 讲的 Agent loop 核心：`while(true)` + 追加消息 + 检查 stop_reason。工具系统、权限系统、API 客户端、UI 渲染都是这个主循环的配件。

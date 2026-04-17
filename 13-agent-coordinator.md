@@ -1,511 +1,132 @@
-# 13. 多 Agent 协调系统
+# 13 - 多 Agent 协调系统
 
-## 1. 模块职责
+## 本文核心问题
 
-多 Agent 协调系统是 Claude Code 的"任务分发与并行执行引擎"——主 Agent 可以动态创建子 Agent，将复杂任务拆解为并行工作流，子 Agent 携带独立的工具权限、隔离的执行上下文，通过异步通知机制将结果汇聚回主 Agent。
-
-**为什么需要这个模块**：单个 Agent 受限于对话轮次和串行执行，无法高效完成大型任务（如"研究 A 同时实现 B"）。多 Agent 模式通过分工让不同的子 Agent 同步/异步并行执行，再由 Coordinator 汇总。
+单个 Agent 是串行的，受限于对话轮次。多 Agent 系统让主 Agent 能把复杂任务拆分给多个子 Agent 并行处理。核心问题：**如何在不破坏安全约束的前提下，实现 Agent 的递归嵌套和异步协调？**
 
 ---
 
-## 2. 核心文件地图
+## 1. 四种执行模式
 
-| 文件 | 行数 | 职责 |
-|------|------|------|
-| `tools/AgentTool/AgentTool.tsx` | 1397 | 核心 AgentTool 实现，子 Agent 创建、执行、结果收集 |
-| `tools/AgentTool/agentToolUtils.ts` | 686 | 工具过滤、异步生命周期、结果 finalize |
-| `tools/AgentTool/runAgent.ts` | 973 | Agent 消息循环执行引擎 |
-| `tools/AgentTool/loadAgentsDir.ts` | 755 | 从目录加载自定义 Agent 定义 |
-| `tools/AgentTool/UI.tsx` | 871 | AgentTool 的 React/Ink 渲染组件 |
-| `tools/SendMessageTool/SendMessageTool.ts` | 917 | 向已启动的子 Agent 发送继续消息，含 Teammate 路由 |
-| `coordinator/coordinatorMode.ts` | 369 | Coordinator 模式检测、系统提示、用户上下文注入 |
-| `tasks/LocalAgentTask/LocalAgentTask.tsx` | ~600 | 后台/前台任务注册、进度跟踪、通知排队 |
-| `tools/shared/spawnMultiAgent.ts` | 1093 | Teammate 多窗格模式，通过 Tmux 创建队友 |
-| `constants/tools.ts` | 112 | 工具权限白名单/黑名单常量 |
+| 模式 | 触发条件 | 特性 |
+|------|---------|------|
+| 同步前台 | 默认 | 阻塞主线程，可随时背景化 |
+| 异步后台 | `run_in_background=true` 或 Coordinator 模式 | 立即返回任务 ID，通知机制汇结果 |
+| Fork 模式 | 无 `subagent_type` 且功能启用 | 继承父上下文，prompt cache 对齐 |
+| Teammate 多窗格 | `team_name && name` | 独立 Tmux 窗格，独立进程 |
+
+四种模式不是功能重复，而是针对不同场景的优化：短任务用同步，并行研究用异步，需要父上下文用 Fork，可视化协作用 Teammate。
 
 ---
 
-## 3. 关键数据结构
+## 2. 同步前台的动态背景化
 
-### 3.1 AgentTool 输入 Schema
+前台执行的子 Agent 可以随时被用户转为后台，靠 `Promise.race()` 实现：
 
-```typescript
-// tools/AgentTool/AgentTool.tsx:83-157
-const inputSchema = z.object({
-  description: z.string(),           // 任务简短描述 (3-5 词)
-  prompt: z.string(),                // 传递给子 Agent 的完整任务
-  subagent_type: z.string().optional(), // Agent 类型，如 'Explore'、'Plan'
-  model: z.enum(['sonnet', 'opus', 'haiku']).optional(), // 模型覆盖
-  run_in_background: z.boolean().optional(), // 强制异步执行
-  name: z.string().optional(),       // 子 Agent 可寻址名称 (SendMessage 路由)
-  team_name: z.string().optional(),  // 多 Agent 队伍名称
-  mode: z.enum(['plan', 'review', 'acceptEdits']).optional(), // 权限模式
-  isolation: z.enum(['worktree', 'remote']).optional(), // 文件系统隔离
-  cwd: z.string().optional(),        // 工作目录覆盖
-});
+```
+Promise.race([下一条消息, 背景化信号])
 ```
 
-### 3.2 AgentTool 输出 Schema（多态）
+用户按 ESC 时，背景化信号 resolve，race 结束。此时：
+1. 已收集的消息完整保留
+2. 新启动后台迭代器从 `runAgent()` 继续
+3. 主线程立即返回 `async_launched`
 
-```typescript
-// 同步完成
-{
-  status: 'completed',
-  content: string,           // 子 Agent 最终回复
-  totalToolUseCount: number, // 工具调用总次数
-  totalDurationMs: number,   // 执行耗时 (ms)
-  prompt: string
-}
+子 Agent 没有被重启，只是从"主线程等待它"切换到"它在后台自己跑"。无损中断，已执行的工作不丢失。
 
-// 异步启动 (run_in_background=true 或 Coordinator 模式)
-{
-  status: 'async_launched',
-  agentId: string,           // 后台任务 ID，供 SendMessage 路由
-  description: string,
-  prompt: string,
-  outputFile: string,        // 进度文件路径，可实时读取
-  canReadOutputFile: boolean
-}
+2 秒后如果子 Agent 还在运行，UI 会显示背景化提示——这是在引导用户"知道可以这么做"，而不是强制的。
 
-// Teammate 模式（多窗格）
-{
-  status: 'teammate_spawned',
-  teammate_id: string,
-  agent_id: string,
-  name: string,
-  tmux_session_name: string,
-  tmux_window_name: string,
-  tmux_pane_id: string
-}
+---
+
+## 3. 三级权限隔离
+
+```
+ALL_AGENT_DISALLOWED_TOOLS   — 所有子 Agent 均不可用
+CUSTOM_AGENT_DISALLOWED_TOOLS — 自定义 Agent 额外限制
+ASYNC_AGENT_ALLOWED_TOOLS    — 异步 Agent 只能访问白名单
 ```
 
-### 3.3 异步 Agent 通知 XML
+最关键的约束：`AgentTool` 本身在 `ALL_AGENT_DISALLOWED_TOOLS` 里。子 Agent 无法再生成子 Agent，防止递归嵌套失控。
+
+异步 Agent 的工具限制最严格（只能访问文件操作和搜索），因为异步执行时没有用户交互，不能弹出权限确认对话框。保守白名单是这个场景下的唯一安全选择。
+
+---
+
+## 4. Fork 模式的 Prompt Cache 对齐
+
+Fork 子 Agent 强制使用父 Agent 的 `renderedSystemPrompt`（字节精确复用），而不是重新生成系统提示。
+
+原因：Anthropic API 的 Prompt Cache 基于内容的字节精确匹配。如果子 Agent 重新生成系统提示，即使语义相同，顺序不同或有任何字节差异，缓存就会 MISS。系统提示在所有请求里是最大的固定成本，MISS 意味着每次请求都要重新计算这几千 token。
+
+字节精确复用确保缓存命中，是一个有实际成本影响的设计决策。
+
+---
+
+## 5. 异步结果汇聚：通知 XML
+
+异步子 Agent 完成后，通过 XML 格式的通知消息把结果注入主 Agent 的下一轮对话：
 
 ```xml
-<!-- tasks/LocalAgentTask/LocalAgentTask.tsx:197-250 -->
 <task-notification>
-  <task-id>{agentId}</task-id>
-  <status>completed|failed|killed</status>
-  <summary>Agent description - status</summary>
-  <result>{子 Agent 最终文本回复}</result>
-  <usage>
-    <total_tokens>N</total_tokens>
-    <tool_uses>N</tool_uses>
-    <duration_ms>N</duration_ms>
-  </usage>
-  <worktree>
-    <path>{worktree_path}</path>     <!-- 若使用 Git Worktree 隔离 -->
-    <branch>{branch_name}</branch>
-  </worktree>
+  <task-id>...</task-id>
+  <status>completed</status>
+  <result>子 Agent 的最终回复</result>
+  <usage><total_tokens>N</total_tokens>...</usage>
 </task-notification>
 ```
 
----
-
-## 4. 执行流程图
-
-### 4.1 子 Agent 创建决策树
-
-```
-AgentTool.call(params)
-       │
-       ├─ team_name && name ──► spawnTeammate() ──► status: teammate_spawned
-       │
-       ├─ !subagent_type && isForkSubagentEnabled()
-       │         └──► Fork Agent (继承父上下文，强制异步)
-       │
-       ├─ isolation === 'remote' ──► teleportToRemote() ──► status: remote_launched
-       │
-       └─ 标准路径
-             │
-             ├─ 从 activeAgents 查找 subagent_type
-             ├─ filterDeniedAgents() 权限检查
-             ├─ 等待 MCP 服务器就绪（最多 30 秒）
-             ├─ isolation === 'worktree' ──► createAgentWorktree()
-             ├─ 构建独立工具池 workerPermissionContext
-             │
-             └─ shouldRunAsync ?
-                    ├─ YES ──► registerAsyncAgent() → fire-and-forget → status: async_launched
-                    └─ NO  ──► registerAgentForeground() → 消息迭代循环
-                                       │
-                                       └─ 用户触发背景化 ──► 动态转换为 async_launched
-```
-
-### 4.2 异步结果汇聚流程
-
-```
-后台子 Agent 执行中
-       │
-       ▼
-runAsyncAgentLifecycle()
-       │
-       ├─ 每条消息 ──► updateAsyncAgentProgress() ──► 实时进度更新
-       │
-       └─ 执行完毕
-             ├─ finalizeAgentTool() ──► 提取最终回复、统计
-             ├─ enqueueAgentNotification() ──► 构建 <task-notification> XML
-             └─ enqueuePendingNotification()
-                    │
-                    ▼
-             主 Agent 下一轮对话
-             ◄──── 接收 <task-notification> 用户消息
-```
+这个 XML 作为 UserMessage 注入，Claude 看到它就知道哪个子任务完成了、结果是什么。不需要特殊的 API，就是普通的消息历史内容。
 
 ---
 
-## 5. 关键代码解析
+## 6. SendMessage 的邮件模型
 
-### 5.1 同步/异步执行决定逻辑
+`SendMessage → queuePendingMessage → drainPendingMessages` 构成异步邮件系统：
 
-```typescript
-// tools/AgentTool/AgentTool.tsx:706-715
-const shouldRunAsync = (
-  run_in_background === true ||           // 用户显式要求后台化
-  selectedAgent.background === true ||    // Agent 定义强制后台
-  isCoordinator ||                        // Coordinator 模式强制异步
-  forceAsync ||                           // Fork 实验强制异步
-  assistantForceAsync ||                  // KAIROS 模式强制异步
-  (proactiveModule?.isProactiveActive() ?? false)  // 主动模块活跃
-) && !isBackgroundTasksDisabled;          // 全局后台任务未禁用
-```
+- 发送者调用 `SendMessage` 后立即继续，不等待接收
+- 消息追加到接收者的 `pendingMessages` 队列
+- 接收者（子 Agent）在下一轮执行开始时自动 drain 队列
 
-**设计亮点**：不是一个开关，而是多个条件的"或"，任一满足即异步——既支持用户主动要求，也支持 Agent 定义内置，还支持运行模式自动推断。
-
-### 5.2 同步前台执行：消息迭代与动态背景化
-
-```typescript
-// tools/AgentTool/AgentTool.tsx:1013-1060
-const agentIterator = runAgent({ ...runAgentParams })[Symbol.asyncIterator]();
-
-while (true) {
-  const elapsed = Date.now() - agentStartTime;
-
-  // 2 秒后展示背景化提示 UI
-  if (!backgroundHintShown && elapsed >= 2000 && toolUseContext.setToolJSX) {
-    toolUseContext.setToolJSX({
-      jsx: <BackgroundHint />,
-      shouldHidePromptInput: false,
-      shouldContinueAnimation: true,
-      showSpinner: true
-    });
-    backgroundHintShown = true;
-  }
-
-  // 关键：竞速 —— 下一条消息 vs 背景化信号
-  const nextMessagePromise = agentIterator.next();
-  const raceResult = backgroundPromise
-    ? await Promise.race([
-        nextMessagePromise.then(r => ({ type: 'message', result: r })),
-        backgroundPromise  // 用户按下 ESC 或超时自动背景化
-      ])
-    : { type: 'message', result: await nextMessagePromise };
-
-  if (raceResult.type === 'background' && foregroundTaskId) {
-    // 触发动态背景化转换：清理前台迭代器，重新以异步模式继续
-    wasBackgrounded = true;
-    // ... 启动后台闭包，立即返回 async_launched
-    return { data: { isAsync: true, status: 'async_launched', ... } };
-  }
-
-  if (raceResult.result.done) break;
-  agentMessages.push(raceResult.result.value);
-}
-```
-
-**设计亮点**：`Promise.race()` 实现"随时可中断"——子 Agent 在前台运行时，任何时刻用户可以按下 ESC 将其转为后台，无需重启，已执行的消息完整保留并继续。
-
-### 5.3 子 Agent 工具权限隔离
-
-```typescript
-// tools/AgentTool/AgentTool.tsx:568-577
-const workerPermissionContext = {
-  ...appState.toolPermissionContext,
-  mode: selectedAgent.permissionMode ?? 'acceptEdits'  // 每个 Agent 有独立权限模式
-};
-const workerTools = assembleToolPool(workerPermissionContext, appState.mcp.tools);
-
-// ...
-availableTools: isForkPath
-  ? toolUseContext.options.tools   // Fork：使用父工具池（保证提示缓存一致）
-  : workerTools,                   // 标准：完全独立的工具池
-```
-
-```typescript
-// tools/AgentTool/agentToolUtils.ts:60-100
-export function filterToolsForAgent({ tools, isBuiltIn, isAsync, permissionMode }) {
-  return tools.filter(tool => {
-    if (tool.name.startsWith('mcp__')) return true;      // MCP 工具始终允许
-    if (ALL_AGENT_DISALLOWED_TOOLS.has(tool.name)) return false; // 全局禁用
-    if (!isBuiltIn && CUSTOM_AGENT_DISALLOWED_TOOLS.has(tool.name)) return false;
-    if (isAsync && !ASYNC_AGENT_ALLOWED_TOOLS.has(tool.name)) return false; // 异步严格限制
-    return true;
-  });
-}
-```
-
-**三级过滤逻辑**：
-- `ALL_AGENT_DISALLOWED_TOOLS`：所有子 Agent 均不可用（如 `Agent` 工具本身——防止无限嵌套）
-- `CUSTOM_AGENT_DISALLOWED_TOOLS`：自定义 Agent 额外限制（无法生成子 Agent）
-- `ASYNC_AGENT_ALLOWED_TOOLS`：异步 Agent 只能访问白名单工具（Bash、Read/Write、Grep、Glob 等）
-
-### 5.4 Coordinator 模式：多 Worker 调度
-
-```typescript
-// coordinator/coordinatorMode.ts:85-138
-export function getCoordinatorUserContext(mcpClients, scratchpadDir) {
-  if (!isCoordinatorMode()) return {};
-
-  // 告知 Coordinator 它的 Worker 有哪些工具可用
-  const workerTools = Array.from(ASYNC_AGENT_ALLOWED_TOOLS)
-    .filter(name => !INTERNAL_WORKER_TOOLS.has(name))
-    .sort()
-    .join(', ');
-
-  let content = `Workers spawned via the ${AGENT_TOOL_NAME} tool have access to these tools: ${workerTools}`;
-
-  // MCP 服务器也透传给 Worker
-  if (mcpClients.length > 0) {
-    content += `\n\nWorkers also have access to MCP tools: ${mcpClients.map(c => c.name).join(', ')}`;
-  }
-
-  // 共享便签本：跨 Worker 持久化知识
-  if (scratchpadDir && isScratchpadGateEnabled()) {
-    content += `\n\nScratchpad directory: ${scratchpadDir}\nWorkers can read and write here without permission prompts...`;
-  }
-
-  return { workerToolsContext: content };
-}
-```
-
-**Coordinator 工作流设计**（系统提示 coordinatorMode.ts:141-231）：
-```
-Research Phase
-  └─ spawn 多个 Worker 并行探索代码库
-Synthesis Phase  
-  └─ Coordinator 汇总所有 <task-notification>，整合发现
-Implementation Phase
-  └─ spawn Worker(s) 并行实现，写入序列化
-Verification Phase
-  └─ spawn 验证 Worker，检查结果
-```
-
-### 5.5 spawnTeammate：Teammate 多窗格实现
-
-Teammate 模式是多 Agent 协调的最高级形态——每个 Teammate 是一个独立的 Claude Code 进程，运行在独立的 Tmux 窗格（或 iTerm2 Split Pane）中，通过邮箱文件与 Team Lead 异步通信。
-
-```typescript
-// tools/shared/spawnMultiAgent.ts:310-400（handleSpawnSplitPane 核心流程）
-async function handleSpawnSplitPane(input, context) {
-  const { name, prompt, agent_type, cwd, plan_mode_required } = input;
-
-  // 1. 解析模型：'inherit' → 继承 leader 模型；undefined → 默认 Opus
-  const model = resolveTeammateModel(input.model, getAppState().mainLoopModel);
-
-  // 2. 检测后端（Tmux / iTerm2 / 外部 Swarm Session）
-  let detectionResult = await detectAndGetBackend();
-
-  // 3. 若检测到 iTerm2 但 it2 未配置，展示 UI 引导用户安装或切换到 Tmux
-  if (detectionResult.needsIt2Setup && context.setToolJSX) {
-    const setupResult = await new Promise(resolve => {
-      context.setToolJSX({ jsx: React.createElement(It2SetupPrompt, { onDone: resolve }) });
-    });
-    if (setupResult === 'cancelled') throw new Error('Teammate spawn cancelled');
-    resetBackendDetection();
-    detectionResult = await detectAndGetBackend();  // 重新检测
-  }
-
-  // 4. 在 Swarm View 中创建窗格（自动处理 tmux 内/外两种情况）
-  const { paneId, isFirstTeammate } = await createTeammatePaneInSwarmView(sanitizedName, teammateColor);
-
-  // 5. 构造启动命令：传入身份 CLI 参数，继承 permission-mode/model/settings
-  const spawnCommand = `cd ${quote([workingDir])} && env ${envStr} ${quote([binaryPath])} \
-    --agent-id ${quote([teammateId])} \
-    --agent-name ${quote([sanitizedName])} \
-    --team-name ${quote([teamName])} \
-    --agent-color ${quote([teammateColor])} \
-    --parent-session-id ${quote([getSessionId()])} \
-    ${inheritedFlags}`;
-
-  await sendCommandToPane(paneId, spawnCommand, !insideTmux);
-
-  // 6. 注册到 AppState.teamContext，让 Tasks Pill 显示队友状态
-  setAppState(prev => ({
-    ...prev,
-    teamContext: {
-      ...prev.teamContext,
-      teammates: {
-        ...(prev.teamContext?.teammates || {}),
-        [teammateId]: { name: sanitizedName, color: teammateColor, tmuxPaneId: paneId, ... }
-      }
-    }
-  }));
-
-  // 7. 写入团队文件，记录成员信息（持久化到磁盘）
-  teamFile.members.push({ agentId: teammateId, name: sanitizedName, ... });
-  await writeTeamFileAsync(teamName, teamFile);
-
-  // 8. 通过邮箱文件发送初始 prompt（Teammate 启动后自动从邮箱取第一条消息）
-  await writeToMailbox(sanitizedName, { from: TEAM_LEAD_NAME, text: prompt }, teamName);
-}
-```
-
-**三种后端的启动差异**：
-
-```
-detectAndGetBackend()
-       │
-       ├─ 已在 Tmux 内 ──► split-window ──► 左侧 Leader，右侧 Teammate 竖排
-       │
-       ├─ iTerm2 可用 ──► it2 split-h ──► 原生 iTerm2 分屏，视觉更美观
-       │
-       └─ 两者都不可用 ──► 创建独立 claude-swarm Session ──► tiled 平铺布局
-```
-
-**模型继承链 `resolveTeammateModel`**：
-
-```typescript
-// tools/shared/spawnMultiAgent.ts:90-100
-export function resolveTeammateModel(inputModel, leaderModel) {
-  if (inputModel === 'inherit') {
-    return leaderModel ?? getDefaultTeammateModel(leaderModel);  // 'inherit' → 复用 leader 模型
-  }
-  return inputModel ?? getDefaultTeammateModel(leaderModel);  // undefined → 使用全局 teammateDefaultModel
-}
-// 优先级：显式指定 > 'inherit'（leader 模型） > 全局配置 > 硬编码兜底
-```
-
-**邮箱通信机制**（Teammate 独立进程的唯一初始化入口）：
-
-```
-Team Lead 调用 writeToMailbox(name, { from, text }, teamName)
-       │
-       ▼
-  写入 ~/.claude/team/{teamName}/mailbox/{name}/inbox/*.json
-       │
-       ▼
-  Teammate 进程启动后的邮箱轮询器自动检测新文件
-       │
-       ▼
-  取出消息作为第一轮 UserMessage 提交给自身的 query 引擎
-```
-
-**重名去重**（`generateUniqueTeammateName`）：
-
-```typescript
-// tools/shared/spawnMultiAgent.ts:265-295
-// 若 "tester" 已存在，自动生成 "tester-2"、"tester-3"...
-export async function generateUniqueTeammateName(baseName, teamName) {
-  const teamFile = await readTeamFileAsync(teamName);
-  const existingNames = new Set(teamFile.members.map(m => m.name.toLowerCase()));
-  if (!existingNames.has(baseName.toLowerCase())) return baseName;
-  let suffix = 2;
-  while (existingNames.has(`${baseName}-${suffix}`.toLowerCase())) suffix++;
-  return `${baseName}-${suffix}`;
-}
-```
-
-### 5.6 SendMessageTool：向存活子 Agent 继续发送消息
-
-```typescript
-// tools/SendMessageTool/SendMessageTool.ts:102-139
-async function handleMessage(recipientName, messageContent, summaryText, toolUseContext) {
-  const appState = toolUseContext.getAppState();
-
-  // 路由到本地后台 Agent 任务
-  const task = appState.tasks[recipientName];
-  if (isLocalAgentTask(task)) {
-    queuePendingMessage(recipientName, messageContent, toolUseContext.setAppState);
-    return { success: true, message: `Queued message for agent ${recipientName}...` };
-  }
-
-  // 路由到 Teammate（多窗格模式）
-  if (isTeammate() && !isTeamLead()) { /* ... */ }
-
-  // 广播到所有队友
-  if (recipientName === '*') { /* ... */ }
-}
-```
-
-```typescript
-// tasks/LocalAgentTask/LocalAgentTask.tsx:162-191
-// 消息入队（SendMessage 写入）
-export function queuePendingMessage(taskId, msg, setAppState) {
-  updateTaskState(taskId, setAppState, task => ({
-    ...task,
-    pendingMessages: [...task.pendingMessages, msg]  // 追加到队列
-  }));
-}
-
-// 消息出队（runAgent 在每轮开始时吸收）
-export function drainPendingMessages(taskId, setAppState): string[] {
-  let drained: string[] = [];
-  updateTaskState(taskId, setAppState, task => {
-    drained = [...task.pendingMessages];
-    return { ...task, pendingMessages: [] };  // 清空队列
-  });
-  return drained;
-}
-```
-
-**设计亮点**：主 Agent 发出 `SendMessage` 后立即继续，消息以"邮件"方式排队，子 Agent 下一轮执行时自动取出——无需同步等待，完全解耦。
+这是完全解耦的：发送者和接收者在各自的时间轴上运行，通过消息队列交换信息。支持点对点（指定名称）和广播（`*`）两种路由。
 
 ---
 
-## 6. 设计思路总结
+## 7. Teammate 多窗格：独立进程架构
 
-### 6.1 四种执行模式分层
+Teammate 是最重型的协调模式——每个 Teammate 是独立的 Claude Code 进程，运行在独立的 Tmux 窗格里。
 
-| 模式 | 触发条件 | 特性 | 适用场景 |
-|------|--------|------|--------|
-| **同步前台** | 默认 | 阻塞主线程，可随时背景化 | 短任务、需要立即结果 |
-| **异步后台** | `run_in_background=true` 或 Coordinator | 立即返回，通知机制汇结果 | 长任务、并行研究 |
-| **Fork 模式** | 无 `subagent_type` 且功能开启 | 继承父上下文，缓存对齐 | 需要父对话上下文的分叉任务 |
-| **Teammate 多窗格** | `team_name && name` | 独立 Tmux 窗格，可视化 | 协作型多步骤项目 |
-
-### 6.2 缓存优化：Fork 的字节级系统提示匹配
-
-Fork 子 Agent 强制使用父 Agent 的 `renderedSystemPrompt`（字节精确），这是精心设计的——若子 Agent 重新生成系统提示，哪怕内容相同但顺序变化，会导致 Anthropic API 的提示缓存 MISS，浪费大量 Token 费用。
-
-```typescript
-// 优先使用已渲染的系统提示，确保缓存 HIT
-if (toolUseContext.renderedSystemPrompt) {
-  forkParentSystemPrompt = toolUseContext.renderedSystemPrompt; // 字节精确
-} else {
-  forkParentSystemPrompt = buildEffectiveSystemPrompt({ ... }); // 重计算，可能 MISS
-}
+进程间通信通过**邮箱文件**：
+```
+~/.claude/team/{teamName}/mailbox/{name}/inbox/*.json
 ```
 
-### 6.3 动态背景化：无损中断
+Team Lead 写入邮箱文件，Teammate 进程启动后轮询邮箱，取出消息作为第一轮 UserMessage。这是文件系统作为 IPC 机制的典型应用：简单、持久化、不需要共享内存或 socket。
 
-子 Agent 在前台执行时，`Promise.race()` 让其随时可被"转为后台"而不中断执行：
-1. 前台迭代器被 `.return()` 优雅关闭
-2. 已收集的消息完整转移
-3. 新的后台迭代器从 `runAgent()` 重新启动
-4. 主线程立即返回 `async_launched`，子 Agent 在后台继续
-
-### 6.4 三级权限隔离防止滥用
-
-- 子 Agent 无法再生成子 Agent（`Agent` 工具在 `ALL_AGENT_DISALLOWED_TOOLS` 中）
-- 自定义 Agent 比内置 Agent 受到更严格限制
-- 异步 Agent 只能访问文件操作和搜索类工具，无法执行交互型操作
-
-### 6.5 消息队列解耦设计
-
-`SendMessage → queuePendingMessage → drainPendingMessages` 三步构成异步邮件系统：
-- 发送者不需要等待接收者
-- 接收者（子 Agent）在自己的执行周期中自然取消
-- 支持广播（`*`）和点对点两种路由
+Teammate 的模型选择有继承链：显式指定 > `'inherit'`（复用 leader 模型）> 全局配置 > 硬编码兜底。
 
 ---
 
-## 7. 与其他模块的联系
+## 8. Coordinator 模式
 
-| 依赖模块 | 联系方式 | 说明 |
-|--------|--------|------|
-| **query.ts / QueryEngine.ts** | `querySource` 路由 | Agent 消息持久化到 Sidechain，主线程与子线程通过 agentId 隔离消息队列 |
-| **tools/AgentTool/agentToolUtils.ts** | 工具过滤、生命周期 | `filterToolsForAgent()`、`runAsyncAgentLifecycle()`、`finalizeAgentTool()` |
-| **tasks/LocalAgentTask** | 任务注册与通知 | `registerAsyncAgent()`、`enqueueAgentNotification()`、进度跟踪 |
-| **services/mcp/** | 工具继承 | 子 Agent 的工具池包含父 Agent 的 MCP 工具 |
-| **06-auth-config（PermissionMode）** | 权限上下文 | 每个子 Agent 有独立的 `permissionMode`（acceptEdits / plan / review） |
-| **02-query-engine（runAgent）** | 执行引擎 | `AgentTool` 调用 `runAgent()` 创建子 Agent 的消息迭代器 |
-| **components/App.tsx** | UI 反馈 | `setToolJSX(<BackgroundHint />)` 在前台执行超过 2 秒时展示提示 |
+Coordinator 是一种特殊的运行模式，Agent 承担"调度者"角色，把任务分解给多个 Worker 并行处理：
+
+```
+Research Phase  — 并行 spawn 多 Worker 探索代码库
+Synthesis Phase — Coordinator 汇总所有通知，整合发现
+Implementation Phase — spawn Worker 并行实现
+Verification Phase — spawn 验证 Worker 检查结果
+```
+
+Coordinator 模式下，所有子 Agent 调用强制异步——Coordinator 不等待任何单个 Worker，而是等待所有通知汇集后再综合。
+
+Worker 可访问共享的 scratchpad 目录，跨 Worker 持久化知识，不需要把所有发现都塞进消息历史。
+
+---
+
+## 设计原则提炼
+
+1. **Promise.race 实现随时可中断**：同步执行任何时刻可转后台，无损
+2. **三级权限隔离**：最保守的约束在最外层（禁止嵌套）
+3. **字节精确 prompt 复用**：缓存命中率是一个有实际成本的设计目标
+4. **文件系统作为 IPC**：邮箱文件让进程间通信持久化、简单
+5. **XML 通知作为普通消息**：不需要特殊协议，结果就是对话里的一条消息
