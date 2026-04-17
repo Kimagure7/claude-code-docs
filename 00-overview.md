@@ -53,8 +53,8 @@ src/
 │   ├── analytics/        # 事件追踪
 │   └── policyLimits/     # 策略限制
 │
-├── components/           # 144 个 React 终端 UI 组件
-├── hooks/                # 83 个自定义 React Hooks
+├── components/           # 146 个 React 终端 UI 组件
+├── hooks/                # 85 个自定义 React Hooks
 ├── ink/                  # 自定义 Ink 终端渲染引擎 (48个模块)
 ├── utils/                # 290+ 工具函数
 ├── constants/            # 21 个常量文件
@@ -69,7 +69,7 @@ src/
 ├── plugins/              # 插件系统入口
 ├── state/                # 应用状态管理
 ├── entrypoints/          # 多入口点 (cli/mcp/init)
-└── migrations/           # 配置迁移 (10个文件)
+└── migrations/           # 配置迁移 (11个文件)
 ```
 
 ---

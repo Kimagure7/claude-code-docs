@@ -8,14 +8,14 @@
 
 | 文件 | 行数 | 描述 |
 |------|------|------|
-| `src/services/plugins/pluginOperations.ts` | 1089 | 插件操作核心库（安装/卸载/启用/更新） |
-| `src/services/plugins/PluginInstallationManager.ts` | 185 | 启动时后台安装管理器 |
-| `src/services/plugins/pluginCliCommands.ts` | 345 | CLI 命令包装层（install/enable/disable/update） |
+| `src/services/plugins/pluginOperations.ts` | 1088 | 插件操作核心库（安装/卸载/启用/更新） |
+| `src/services/plugins/PluginInstallationManager.ts` | 184 | 启动时后台安装管理器 |
+| `src/services/plugins/pluginCliCommands.ts` | 344 | CLI 命令包装层（install/enable/disable/update） |
 | `src/plugins/builtinPlugins.ts` | 160 | 内置插件注册表 |
 | `src/plugins/bundled/index.ts` | 24 | 内置捆绑插件初始化入口 |
-| `src/skills/bundledSkills.ts` | 221 | 内置技能定义类型 + 注册机制 |
-| `src/skills/loadSkillsDir.ts` | 1087 | 技能加载核心：文件遍历、frontmatter 解析、去重、动态发现 |
-| `src/skills/mcpSkillBuilders.ts` | 45 | MCP 协议技能构建器注册表 |
+| `src/skills/bundledSkills.ts` | 220 | 内置技能定义类型 + 注册机制 |
+| `src/skills/loadSkillsDir.ts` | 1086 | 技能加载核心：文件遍历、frontmatter 解析、去重、动态发现 |
+| `src/skills/mcpSkillBuilders.ts` | 44 | MCP 协议技能构建器注册表 |
 | `src/types/plugin.ts` | 364 | 插件类型定义（PluginError、BuiltinPluginDefinition 等） |
 
 ## 3. 关键数据结构

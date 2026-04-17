@@ -14,6 +14,9 @@
 |------|------|------|
 | `tools/AgentTool/AgentTool.tsx` | 1397 | 核心 AgentTool 实现，子 Agent 创建、执行、结果收集 |
 | `tools/AgentTool/agentToolUtils.ts` | 686 | 工具过滤、异步生命周期、结果 finalize |
+| `tools/AgentTool/runAgent.ts` | 973 | Agent 消息循环执行引擎 |
+| `tools/AgentTool/loadAgentsDir.ts` | 755 | 从目录加载自定义 Agent 定义 |
+| `tools/AgentTool/UI.tsx` | 871 | AgentTool 的 React/Ink 渲染组件 |
 | `tools/SendMessageTool/SendMessageTool.ts` | 917 | 向已启动的子 Agent 发送继续消息，含 Teammate 路由 |
 | `coordinator/coordinatorMode.ts` | 369 | Coordinator 模式检测、系统提示、用户上下文注入 |
 | `tasks/LocalAgentTask/LocalAgentTask.tsx` | ~600 | 后台/前台任务注册、进度跟踪、通知排队 |

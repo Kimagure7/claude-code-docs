@@ -8,24 +8,29 @@
 
 ## 2. 核心文件地图
 
-| 文件 | 大致行数 | 职责 |
-|------|---------|------|
-| `services/compact/compact.ts` | 1706 | 核心压缩引擎，API 调用生成摘要 |
-| `services/compact/autoCompact.ts` | 352 | 自动压缩触发与阈值管理 |
-| `services/compact/sessionMemoryCompact.ts` | 631 | 基于会话记忆的轻量压缩路径 |
-| `services/compact/microCompact.ts` | 531 | 微压缩，清理工具结果无需 API 调用 |
-| `services/compact/grouping.ts` | 64 | 按 API 轮次分组消息 |
-| `services/compact/prompt.ts` | 375+ | 压缩提示模板 |
-| `services/SessionMemory/sessionMemory.ts` | 496+ | 记忆提取控制器，后台 agent |
-| `services/SessionMemory/sessionMemoryUtils.ts` | 208+ | 记忆状态工具函数 |
-| `services/SessionMemory/prompts.ts` | — | 记忆提取提示模板 |
-| `memdir/memdir.ts` | 508+ | 记忆文件目录管理 |
-| `memdir/memoryTypes.ts` | 272 | 记忆分类系统定义 |
-| `memdir/memoryScan.ts` | 95 | 记忆文件扫描与列表 |
-| `memdir/findRelevantMemories.ts` | 142+ | 相关记忆检索 |
-| `memdir/memoryAge.ts` | 54 | 记忆新鲜度计算 |
-| `memdir/paths.ts` | 279 | 记忆路径解析与安全验证 |
-| `utils/sessionStorage.ts` | 5106+ | 消息持久化与转录读写 |
+| 文件 | 行数 | 职责 |
+|------|------|------|
+| `services/compact/compact.ts` | 1705 | 核心压缩引擎，API 调用生成摘要 |
+| `services/compact/autoCompact.ts` | 351 | 自动压缩触发与阈值管理 |
+| `services/compact/sessionMemoryCompact.ts` | 630 | 基于会话记忆的轻量压缩路径 |
+| `services/compact/microCompact.ts` | 530 | 微压缩，清理工具结果无需 API 调用 |
+| `services/compact/grouping.ts` | 63 | 按 API 轮次分组消息 |
+| `services/compact/prompt.ts` | 374 | 压缩提示模板 |
+| `services/compact/apiMicrocompact.ts` | 153 | API 调用式微压缩（缓存编辑优化） |
+| `services/compact/postCompactCleanup.ts` | 77 | 压缩后清理：readFileState 重置等 |
+| `services/compact/timeBasedMCConfig.ts` | 43 | 时间触发的微压缩配置 |
+| `services/compact/compactWarningHook.ts` | 16 | 压缩警告 Hook |
+| `services/compact/compactWarningState.ts` | 18 | 压缩警告状态管理 |
+| `services/SessionMemory/sessionMemory.ts` | 495 | 记忆提取控制器，后台 agent |
+| `services/SessionMemory/sessionMemoryUtils.ts` | 207 | 记忆状态工具函数 |
+| `services/SessionMemory/prompts.ts` | 324 | 记忆提取提示模板 |
+| `memdir/memdir.ts` | 507 | 记忆文件目录管理 |
+| `memdir/memoryTypes.ts` | 271 | 记忆分类系统定义 |
+| `memdir/memoryScan.ts` | 94 | 记忆文件扫描与列表 |
+| `memdir/findRelevantMemories.ts` | 141 | 相关记忆检索 |
+| `memdir/memoryAge.ts` | 53 | 记忆新鲜度计算 |
+| `memdir/paths.ts` | 278 | 记忆路径解析与安全验证 |
+| `utils/sessionStorage.ts` | 5105 | 消息持久化与转录读写 |
 | `utils/sessionState.ts` | 151 | 会话状态管理 |
 | `utils/teamMemoryOps.ts` | 89 | 团队记忆操作 |
 

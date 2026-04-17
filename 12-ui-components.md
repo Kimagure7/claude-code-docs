@@ -8,16 +8,16 @@ Claude Code 的 CLI 界面并非普通的文本打印，而是一套基于 **Rea
 
 | 文件 | 行数 | 描述 |
 |------|------|------|
-| `src/ink/ink.tsx` | 1723 | Ink 主类：生命周期、渲染调度、事件分发 |
-| `src/ink/screen.ts` | 1487 | 虚拟屏幕缓冲区：双缓冲、字符池、样式池 |
-| `src/ink/render-node-to-output.ts` | 1463 | DOM 树 → 屏幕缓冲区转换（布局遍历） |
-| `src/ink/log-update.ts` | 774 | 差异化 ANSI 渲染：帧间对比，最小化终端写入 |
-| `src/ink/parse-keypress.ts` | 802 | 键盘输入解析：支持 6 种终端键盘协议 |
+| `src/ink/ink.tsx` | 1722 | Ink 主类：生命周期、渲染调度、事件分发 |
+| `src/ink/screen.ts` | 1486 | 虚拟屏幕缓冲区：双缓冲、字符池、样式池 |
+| `src/ink/render-node-to-output.ts` | 1462 | DOM 树 → 屏幕缓冲区转换（布局遍历） |
+| `src/ink/log-update.ts` | 773 | 差异化 ANSI 渲染：帧间对比，最小化终端写入 |
+| `src/ink/parse-keypress.ts` | 801 | 键盘输入解析：支持 6 种终端键盘协议 |
 | `src/ink/selection.ts` | 917 | 文本选择与复制（鼠标选取） |
 | `src/ink/styles.ts` | 771 | 样式系统：颜色转换、ANSI 属性映射 |
-| `src/components/App.tsx` | 56 | 应用顶层组件：Provider 嵌套入口 |
-| `src/components/` | 113个文件 | 全部 UI 组件 |
-| `src/hooks/` | 83个文件 | 自定义 React Hooks |
+| `src/components/App.tsx` | 55 | 应用顶层组件：Provider 嵌套入口 |
+| `src/components/` | 146个文件 | 全部 UI 组件 |
+| `src/hooks/` | 85个文件 | 自定义 React Hooks |
 
 ## 3. 关键数据结构
 

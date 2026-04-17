@@ -13,17 +13,28 @@ Claude Code 的工具能力不仅限于内置工具，用户可以通过 MCP 接
 
 ```
 services/mcp/
-├── client.ts               # 3349行 — MCP 客户端主逻辑（连接、工具获取、工具调用）
-├── types.ts                # 259行  — 所有 MCP 类型定义（配置 schema、连接状态、序列化）
-├── config.ts               # 1579行 — 配置加载：读取 .mcp.json / settings.json / 企业配置
-├── MCPConnectionManager.tsx # 73行  — React Context 包装，提供 reconnect/toggle 给 UI
+├── client.ts                  # 3348行 — MCP 客户端主逻辑（连接、工具获取、工具调用）
+├── types.ts                   # 258行  — 所有 MCP 类型定义（配置 schema、连接状态、序列化）
+├── config.ts                  # 1578行 — 配置加载：读取 .mcp.json / settings.json / 企业配置
+├── MCPConnectionManager.tsx   # React Context 包装，提供 reconnect/toggle 给 UI
 ├── useManageMCPConnections.ts # 连接状态 React Hook
-├── normalization.ts        # 24行  — MCP 工具/服务器名称规范化（兼容 API 字符集）
-├── channelPermissions.ts   # 频道权限检查（plugin 来源的服务器访问控制）
-├── auth.ts                 # OAuth 认证提供者（ClaudeAuthProvider）
-├── elicitationHandler.ts   # URL Elicitation 处理（需用户打开浏览器完成 OAuth）
-├── InProcessTransport.ts   # 同进程传输层（用于测试和 SDK 模式）
-└── envExpansion.ts         # 配置中的环境变量展开
+├── normalization.ts           # MCP 工具/服务器名称规范化（兼容 API 字符集）
+├── channelPermissions.ts      # 频道权限检查（plugin 来源的服务器访问控制）
+├── channelAllowlist.ts        # 频道白名单配置
+├── channelNotification.ts     # 频道通知处理
+├── auth.ts                    # OAuth 认证提供者（ClaudeAuthProvider）
+├── elicitationHandler.ts      # URL Elicitation 处理（需用户打开浏览器完成 OAuth）
+├── InProcessTransport.ts      # 同进程传输层（用于测试和 SDK 模式）
+├── SdkControlTransport.ts     # SDK 控制传输层
+├── envExpansion.ts            # 配置中的环境变量展开
+├── headersHelper.ts           # 请求头辅助工具
+├── mcpStringUtils.ts          # MCP 字符串工具
+├── officialRegistry.ts        # 官方 MCP 服务器注册表
+├── claudeai.ts                # Claude.ai 平台特有 MCP 配置
+├── oauthPort.ts               # OAuth 回调端口管理
+├── vscodeSdkMcp.ts            # VS Code SDK 集成
+├── xaa.ts                     # XAA 协议支持
+└── xaaIdpLogin.ts             # XAA IDP 登录流程
 ```
 
 ---

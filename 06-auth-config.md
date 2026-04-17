@@ -10,11 +10,11 @@
 
 | 文件 | 行数 | 职责 |
 |------|------|------|
-| `utils/auth.ts` | 2003 | 认证令牌获取、API Key 管理、AWS/GCP 凭证刷新 |
-| `utils/config.ts` | 1818 | 全局/项目配置读写、文件锁、内存缓存 |
-| `services/oauth/index.ts` | 199 | OAuth 2.0 PKCE 流程入口类 |
-| `services/oauth/client.ts` | 567 | 构建 Auth URL、交换 code、刷新令牌 |
-| `services/oauth/crypto.ts` | 24 | PKCE code_verifier / code_challenge 生成 |
+| `utils/auth.ts` | 2002 | 认证令牌获取、API Key 管理、AWS/GCP 凭证刷新 |
+| `utils/config.ts` | 1817 | 全局/项目配置读写、文件锁、内存缓存 |
+| `services/oauth/index.ts` | 198 | OAuth 2.0 PKCE 流程入口类 |
+| `services/oauth/client.ts` | 566 | 构建 Auth URL、交换 code、刷新令牌 |
+| `services/oauth/crypto.ts` | 23 | PKCE code_verifier / code_challenge 生成 |
 | `services/oauth/auth-code-listener.ts` | - | 本地 HTTP 监听器，捕获 redirect callback |
 
 ---
