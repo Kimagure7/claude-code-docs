@@ -24,6 +24,7 @@
 | [11-plugin-skill.md](./11-plugin-skill.md) | 插件与技能系统 |
 | [12-ui-components.md](./12-ui-components.md) | React + Ink 终端 UI 组件体系 |
 | [13-agent-coordinator.md](./13-agent-coordinator.md) | 多 Agent 协调模式 |
+| [14-request-trace.md](./14-request-trace.md) | **一次请求的完整生命周期追踪**（串联全部模块的实战路径） |
 
 ---
 
@@ -39,6 +40,7 @@
 06-auth-config    → 理解认证与配置
 05-mcp-protocol   → 理解 MCP 扩展机制
 08~13             → 按需深入各扩展功能
+14-request-trace  → 综合复习：追踪一次真实请求的完整执行路径
 ```
 
 ---
